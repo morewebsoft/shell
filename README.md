@@ -38,8 +38,7 @@ Upon launching, IntelliShell will default to Google's `gemini-1.5-flash` model, 
 
 - **`<natural language>`**: Describe your task (e.g., `"find all python files modified today"`, `"undo my last git commit"`).
 - **`<native command>`**: Standard terminal commands work as usual (e.g., `ls`, `cd`, `git status`).
-- **`/model`**: Opens the interactive AI provider and model configuration setup.
-- **`/settings`**: Opens the preferences menu (Auto-execution, Modes, etc.).
+- **`/setup`**: Opens the interactive configuration menu for AI providers, models, API keys, and execution preferences.
 - **`/version`**: Displays the current version of IntelliShell.
 - **`exit`**: Quits IntelliShell.
 

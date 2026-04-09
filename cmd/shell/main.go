@@ -78,7 +78,7 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 		return line
 	}
 
-	cmds := []string{"/settings", "/model", "/version", "/help"}
+	cmds := []string{"/setup", "/version", "/help"}
 	var matches []string
 	for _, cmd := range cmds {
 		if strings.HasPrefix(cmd, s) {
@@ -92,9 +92,9 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 	}
 
 	if len(matches) > 0 {
-		suggestion := strings.Join(matches, "  ")
-		// Save cursor position, print suggestion, clear leftovers, restore cursor
-		ghost := fmt.Sprintf("\033[s      %s%s%s\033[K\033[u", colorGrey, suggestion, colorReset)
+		// Get the remaining part of the first match to act as true inline ghost text
+		suggestion := matches[0][len(s):]
+		ghost := fmt.Sprintf("%s%s%s", colorGrey, suggestion, colorReset)
 		
 		res := make([]rune, len(line))
 		copy(res, line)
@@ -106,13 +106,18 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 }
 
 func main() {
+	// Hidden entrypoint for the seccomp sandbox process
+	if len(os.Args) > 2 && os.Args[1] == "__sandbox_exec" {
+		runSandboxedChild(os.Args[2])
+		return
+	}
+
 	loadConfig()
 	ctx := context.Background()
 
 	// Configure autocomplete for / commands
 	completer := readline.NewPrefixCompleter(
-		readline.PcItem("/settings"),
-		readline.PcItem("/model"),
+		readline.PcItem("/setup"),
 		readline.PcItem("/version"),
 		readline.PcItem("/help"),
 		readline.PcItem("exit"),
@@ -131,7 +136,7 @@ func main() {
 	}
 	defer rl.Close()
 
-	fmt.Println("Welcome to IntelliShell. Type natural language, native commands, '/model' for AI setup, '/settings' for preferences, or 'exit' to quit.")
+	fmt.Println("Welcome to IntelliShell. Type natural language, native commands, '/setup' for configuration and preferences, or 'exit' to quit.")
 
 	for {
 		cwd, _ := os.Getwd()
@@ -151,15 +156,9 @@ func main() {
 			break
 		}
 
-		// Handle the settings menu
-		if strings.HasPrefix(input, "/settings") {
-			handleSettings()
-			continue
-		}
-
-		// Handle the model config menu
-		if strings.HasPrefix(input, "/model") {
-			handleModelConfig(ctx)
+		// Handle the setup menu
+		if strings.HasPrefix(input, "/setup") {
+			handleSetup()
 			continue
 		}
 
@@ -169,11 +168,24 @@ func main() {
 			continue
 		}
 
+		// Handle the help command
+		if strings.HasPrefix(input, "/help") {
+			fmt.Printf("\n%s🧠 IntelliShell Help%s\n", colorCyan, colorReset)
+			fmt.Printf("%s======================%s\n", colorGrey, colorReset)
+			fmt.Printf("  %s<natural language>%s : Describe your task (e.g., 'find large files', 'undo last commit')\n", colorYellow, colorReset)
+			fmt.Printf("  %s<native command>%s   : Run standard terminal commands (e.g., 'ls', 'cd', 'git status')\n", colorYellow, colorReset)
+			fmt.Printf("  %s/setup%s             : Configure AI providers, models, and execution preferences\n", colorGreen, colorReset)
+			fmt.Printf("  %s/version%s           : Display the current version of IntelliShell\n", colorGreen, colorReset)
+			fmt.Printf("  %s/help%s              : Show this help menu\n", colorGreen, colorReset)
+			fmt.Printf("  %sexit%s               : Quit the application\n\n", colorRed, colorReset)
+			continue
+		}
+
 		// Check for a preset command first for performance and to bypass AI
 		if command, found := presets.CheckForPreset(input); found {
 			fmt.Printf("%s-> %s%s\n", colorGreen, command, colorReset) // Show the resolved command
 			// Presets are considered safe and are executed directly
-			executeCommand(command)
+			executeCommand(command, true, rl)
 			continue // Skip AI and go to next prompt
 		}
 
@@ -200,7 +212,8 @@ func main() {
 		command, isSafe := generateCommandFromAI(ctx, input, done)
 
 		// 2. Safety Verification
-		if !isSafe || !config.AutoExecute {
+		needsExplicitConfirm := !isSafe || !config.AutoExecute
+		if needsExplicitConfirm {
 			msg := "Command might be unsafe."
 			if config.AutoExecute && !isSafe {
 				msg = "Command is UNSAFE."
@@ -222,33 +235,32 @@ func main() {
 		}
 
 		// 3. Execution
-		executeCommand(command)
+		executeCommand(command, needsExplicitConfirm, rl)
 	}
 }
 
-func handleSettings() {
+func handleSetup() {
 	for {
 		// Prepare status indicators
-		apiStatus := "❌ Not Configured"
+		apiStatus := "Not Configured"
 		if config.APIKey != "" || config.Provider == "ollama" || config.Provider == "lmstudio" {
-			apiStatus = fmt.Sprintf("✅ Configured (%s)", config.Provider)
+			apiStatus = fmt.Sprintf("Configured - %s", config.Provider)
 		}
 
-		autoExecStatus := "🔴 OFF (Always Ask)"
+		autoExecStatus := "OFF - Always Ask"
 		if config.AutoExecute {
-			autoExecStatus = "🟢 ON (Ask only on unsafe)"
+			autoExecStatus = "ON - Ask only on unsafe"
 		}
 
 		var category string
 		err := huh.NewForm(
 			huh.NewGroup(
 				huh.NewSelect[string]().
-					Title("⚙️ IntelliShell Settings").
 					Description("Choose a category to modify:").
 					Options(
-						huh.NewOption("🤖 AI Configuration (Current: "+apiStatus+")", "ai"),
-						huh.NewOption("⚡ Execution Settings (Current: "+autoExecStatus+")", "exec"),
-						huh.NewOption("🔙 Back to Shell", "exit"),
+						huh.NewOption("AI Configuration ("+apiStatus+")", "ai"),
+						huh.NewOption("Execution ("+autoExecStatus+")", "exec"),
+						huh.NewOption("Back to Shell", "exit"),
 					).
 					Value(&category),
 			),
@@ -264,11 +276,11 @@ func handleSettings() {
 			err := huh.NewForm(
 				huh.NewGroup(
 					huh.NewSelect[string]().
-						Title("🤖 AI Configuration").
+						Title("AI Configuration").
 						Options(
-							huh.NewOption("🔄 Update Model / API Key", "update"),
-							huh.NewOption("👀 Show Current Config", "show"),
-							huh.NewOption("🔙 Back", "back"),
+							huh.NewOption("Update Model / API Key", "update"),
+							huh.NewOption("Show Current Config", "show"),
+							huh.NewOption("Back", "back"),
 						).
 						Value(&aiAction),
 				),
@@ -300,10 +312,10 @@ func handleSettings() {
 			err := huh.NewForm(
 				huh.NewGroup(
 					huh.NewSelect[string]().
-						Title("⚡ Execution Settings").
+						Title("Execution Settings").
 						Options(
 							huh.NewOption(toggleLabel, "toggle"),
-							huh.NewOption("🔙 Back", "back"),
+							huh.NewOption("Back", "back"),
 						).
 						Value(&execAction),
 				),
@@ -540,7 +552,7 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 
 	if config.APIKey == "" && config.Provider != "ollama" && config.Provider != "lmstudio" {
 		stopSpinner()
-		fmt.Printf("\r%sError: API key is not configured. Please use '/model' to set it.%s\n", colorRed, colorReset)
+		fmt.Printf("\r%sError: API key is not configured. Please use '/setup' to set it.%s\n", colorRed, colorReset)
 		return "", true
 	}
 
@@ -711,7 +723,7 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 	return fullResponse, isSafe
 }
 
-func executeCommand(cmdStr string) {
+func executeCommand(cmdStr string, forceUnsandboxed bool, rl *readline.Instance) {
 	if cmdStr == "" {
 		return
 	}
@@ -740,7 +752,15 @@ func executeCommand(cmdStr string) {
 	}
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
+	useSandbox := false
+	if !forceUnsandboxed && isSandboxSupported() {
+		useSandbox = true
+	}
+
+	if useSandbox {
+		exe, _ := os.Executable()
+		cmd = exec.Command(exe, "__sandbox_exec", cmdStr)
+	} else if runtime.GOOS == "windows" {
 		cmd = exec.Command("cmd", "/c", cmdStr)
 	} else {
 		// Try to use bash for better compatibility with AI-generated commands, fallback to sh
@@ -758,6 +778,22 @@ func executeCommand(cmdStr string) {
 
 	err := cmd.Run()
 	if err != nil {
+		if useSandbox && isSigSys(err) {
+			fmt.Printf("\n%s🛡️  Seccomp Sandbox Triggered!%s\n", colorRed, colorReset)
+			fmt.Printf("%sThe command attempted a restricted system call (e.g., file deletion).%s\n", colorYellow, colorReset)
+			fmt.Printf("%sExecute anyway without restrictions? (y/n):%s ", colorYellow, colorReset)
+			
+			confirmLine, readErr := rl.ReadlineWithDefault("")
+			if readErr != nil {
+				return
+			}
+			if strings.ToLower(strings.TrimSpace(confirmLine)) == "y" {
+				executeCommand(cmdStr, true, rl) // recursively re-run unsandboxed
+			} else {
+				fmt.Println("Execution cancelled.")
+			}
+			return
+		}
 		fmt.Printf("%sCommand failed:%s %v\n", colorRed, colorReset, err)
 	}
 }
