@@ -1,2 +1,24 @@
-# Added by goreleaser init:
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+*.prof
+
+# GoReleaser output
 dist/
+
+# Go workspace
+go.work
+go.work.sum
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/
+*.swp
