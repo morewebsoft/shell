@@ -74,7 +74,7 @@ type commandPainter struct{}
 
 func (p *commandPainter) Paint(line []rune, pos int) []rune {
 	s := string(line)
-	if !strings.HasPrefix(s, "/") || strings.Contains(s, " ") {
+	if !strings.HasPrefix(s, "/") || strings.Contains(s, " ") || colorGrey == "" {
 		return line
 	}
 
@@ -86,9 +86,15 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 		}
 	}
 
+	// Hide the suggestion if the user has fully typed the command
+	if len(matches) == 1 && matches[0] == s {
+		return line
+	}
+
 	if len(matches) > 0 {
 		suggestion := strings.Join(matches, "  ")
-		ghost := fmt.Sprintf("      %s%s%s", colorGrey, suggestion, colorReset)
+		// Save cursor position, print suggestion, clear leftovers, restore cursor
+		ghost := fmt.Sprintf("\033[s      %s%s%s\033[K\033[u", colorGrey, suggestion, colorReset)
 		
 		res := make([]rune, len(line))
 		copy(res, line)
