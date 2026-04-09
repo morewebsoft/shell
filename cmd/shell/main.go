@@ -29,7 +29,7 @@ type AppConfig struct {
 	Model        string
 	APIKey       string
 	AutoExecute  bool
-	HistoryLimit int // New: Max number of history items to keep for context
+	HistoryLimit int
 }
 
 type HistoryEntry struct {
@@ -54,7 +54,7 @@ var (
 		Provider:     "google",
 		Model:        "gemini-1.5-flash",
 		APIKey:       os.Getenv("GEMINI_API_KEY"),
-		HistoryLimit: 10, // Default to last 10 items
+		HistoryLimit: 10,
 	}
 	history []HistoryEntry
 
@@ -145,6 +145,7 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 func main() {
 	loadConfig()
 	loadHistory()
+
 	ctx := context.Background()
 
 	// Configure autocomplete for / commands
@@ -161,7 +162,6 @@ func main() {
 		AutoComplete:    completer,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
-		Painter:         &commandPainter{},
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error initializing readline:", err)
@@ -275,7 +275,7 @@ func handleSettings() {
 	for {
 		// Prepare status indicators
 		apiStatus := "❌ Not Configured"
-		if config.APIKey != "" || config.Provider == "ollama" || config.Provider == "lmstudio" {
+		if config.APIKey != "" {
 			apiStatus = fmt.Sprintf("✅ Configured (%s)", config.Provider)
 		}
 
@@ -327,8 +327,6 @@ func handleSettings() {
 					keyPreview = config.APIKey[:4] + "..." + config.APIKey[len(config.APIKey)-4:]
 				} else if config.APIKey != "" {
 					keyPreview = "****"
-				} else if config.Provider == "ollama" || config.Provider == "lmstudio" {
-					keyPreview = "Not required for local providers"
 				}
 				fmt.Printf("\n%sCurrent AI Config:%s\n• Provider: %s\n• Model: %s\n• API Key: %s\n\n", colorCyan, colorReset, config.Provider, config.Model, keyPreview)
 				fmt.Print("Press Enter to continue...")
@@ -377,8 +375,6 @@ func fetchAIRegistry() AIRegistry {
 			{ID: "groq", Name: "Groq", Models: []string{}},
 			{ID: "openrouter", Name: "OpenRouter", Models: []string{}},
 			{ID: "vertex", Name: "Vertex AI", Models: []string{}},
-			{ID: "ollama", Name: "Ollama (Local)", Models: []string{}},
-			{ID: "lmstudio", Name: "LM Studio (Local)", Models: []string{}},
 		},
 	}
 
@@ -423,10 +419,6 @@ func fetchModelsForProvider(provider, apiKey string) []string {
 		apiURL = "https://api.openai.com/v1/models"
 	case "google":
 		apiURL = "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey
-	case "ollama":
-		apiURL = "http://localhost:11434/v1/models"
-	case "lmstudio":
-		apiURL = "http://localhost:1234/v1/models"
 	default:
 		return nil
 	}
@@ -491,7 +483,7 @@ func handleModelConfig(ctx context.Context) {
 				Options(providerOptions...).
 				Value(&p),
 			huh.NewInput().
-				Title("API Key (leave blank for local providers)").
+				Title("API Key").
 				EchoMode(huh.EchoModePassword).
 				Value(&k),
 		),
@@ -583,7 +575,7 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 	}
 	defer stopSpinner() // Ensure spinner channel is always resolved
 
-	if config.APIKey == "" && config.Provider != "ollama" && config.Provider != "lmstudio" {
+	if config.APIKey == "" {
 		stopSpinner()
 		fmt.Printf("\r%sError: API key is not configured. Please use '/model' to set it.%s\n", colorRed, colorReset)
 		return "", true
@@ -591,7 +583,6 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 
 	var baseURL string
 	modelID := config.Model
-
 	switch config.Provider {
 	case "google":
 		baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -601,10 +592,6 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 		baseURL = "https://api.groq.com/openai/v1/chat/completions"
 	case "openrouter":
 		baseURL = "https://openrouter.ai/api/v1/chat/completions"
-	case "ollama":
-		baseURL = "http://localhost:11434/v1/chat/completions"
-	case "lmstudio":
-		baseURL = "http://localhost:1234/v1/chat/completions"
 	default:
 		// Use OpenRouter as the unified source to hit the latest API endpoints for any other provider
 		baseURL = "https://openrouter.ai/api/v1/chat/completions"
@@ -654,9 +641,7 @@ User input: %s`, runtime.GOOS, historyContext, runtime.GOOS, cwd, input)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if config.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+config.APIKey)
-	}
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
 	if baseURL == "https://openrouter.ai/api/v1/chat/completions" {
 		req.Header.Set("HTTP-Referer", "https://github.com/tadB0x/IntelliShell")
 		req.Header.Set("X-Title", "IntelliShell")
@@ -840,7 +825,6 @@ If it's dangerous, prefix with "UNSAFE: ".`, originalInput, failedCommand, error
 func callAIForCorrection(ctx context.Context, prompt string) (string, bool) {
 	var baseURL string
 	modelID := config.Model
-
 	switch config.Provider {
 	case "google":
 		baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -848,6 +832,8 @@ func callAIForCorrection(ctx context.Context, prompt string) (string, bool) {
 		baseURL = "https://api.openai.com/v1/chat/completions"
 	case "groq":
 		baseURL = "https://api.groq.com/openai/v1/chat/completions"
+	case "openrouter":
+		baseURL = "https://openrouter.ai/api/v1/chat/completions"
 	default:
 		baseURL = "https://openrouter.ai/api/v1/chat/completions"
 		if !strings.Contains(modelID, "/") && config.Provider != "" {
