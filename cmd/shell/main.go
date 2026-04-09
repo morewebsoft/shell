@@ -25,10 +25,17 @@ import (
 )
 
 type AppConfig struct {
-	Provider    string
-	Model       string
-	APIKey      string
-	AutoExecute bool
+	Provider     string
+	Model        string
+	APIKey       string
+	AutoExecute  bool
+	HistoryLimit int // New: Max number of history items to keep for context
+}
+
+type HistoryEntry struct {
+	Timestamp string `json:"timestamp"`
+	Input     string `json:"input"`
+	Command   string `json:"command"`
 }
 
 // AIRegistry represents a dynamic list of providers and models
@@ -43,11 +50,13 @@ type ProviderConfig struct {
 }
 
 var (
-	config   = AppConfig{
-		Provider: "google",
-		Model:    "gemini-1.5-flash",
-		APIKey:   os.Getenv("GEMINI_API_KEY"),
+	config = AppConfig{
+		Provider:     "google",
+		Model:        "gemini-1.5-flash",
+		APIKey:       os.Getenv("GEMINI_API_KEY"),
+		HistoryLimit: 10, // Default to last 10 items
 	}
+	history []HistoryEntry
 
 	colorCyan   = "\033[36m"
 	colorGreen  = "\033[32m"
@@ -58,6 +67,32 @@ var (
 	colorReset  = "\033[0m"
 	clearLine   = "\r\033[K"
 )
+
+func getHistoryPath() string {
+	home, _ := os.UserHomeDir()
+	configDir := filepath.Join(home, ".intellishell")
+	_ = os.MkdirAll(configDir, 0755)
+	return filepath.Join(configDir, "history.json")
+}
+
+func loadHistory() {
+	path := getHistoryPath()
+	data, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(data, &history)
+	}
+}
+
+func saveHistory(entry HistoryEntry) {
+	history = append(history, entry)
+	// Keep only the last N items
+	if len(history) > config.HistoryLimit {
+		history = history[len(history)-config.HistoryLimit:]
+	}
+	path := getHistoryPath()
+	data, _ := json.MarshalIndent(history, "", "  ")
+	_ = os.WriteFile(path, data, 0644)
+}
 
 func init() {
 	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" || (runtime.GOOS == "windows" && os.Getenv("TERM") == "" && os.Getenv("WT_SESSION") == "") {
@@ -109,6 +144,7 @@ func (p *commandPainter) Paint(line []rune, pos int) []rune {
 
 func main() {
 	loadConfig()
+	loadHistory()
 	ctx := context.Background()
 
 	// Configure autocomplete for / commands
@@ -200,6 +236,13 @@ func main() {
 
 		// 1. Send English text to real AI for translation
 		command, isSafe := generateCommandFromAI(ctx, input, done)
+
+		// Save to persistent history
+		saveHistory(HistoryEntry{
+			Timestamp: time.Now().Format(time.RFC3339),
+			Input:     input,
+			Command:   command,
+		})
 
 		// 2. Safety Verification
 		if !isSafe || !config.AutoExecute {
@@ -569,7 +612,15 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 	}
 
 	cwd, _ := os.Getwd()
-	prompt := fmt.Sprintf(`You are a lightweight AI shell assistant for %s. 
+	var historyContext string
+	if len(history) > 0 {
+		historyContext = "\nRecent history:\n"
+		for _, h := range history {
+			historyContext += fmt.Sprintf("- User: %s -> Cmd: %s\n", h.Input, h.Command)
+		}
+	}
+
+	prompt := fmt.Sprintf(`You are a lightweight AI shell assistant for %s.%s
 Translate the user's natural language into a valid %s terminal command.
 The current working directory is: %s
 If the input is already a valid command, return it as is.
@@ -577,7 +628,7 @@ Return ONLY the raw command. Do not wrap it in quotes, markdown, or JSON.
 If the command is destructive or dangerous (e.g., delete, format, rmdir), prefix it EXACTLY with "UNSAFE: ".
 Otherwise, just output the command directly.
 
-User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
+User input: %s`, runtime.GOOS, historyContext, runtime.GOOS, cwd, input)
 
 	reqBody := map[string]interface{}{
 		"model": modelID,
@@ -714,6 +765,28 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 }
 
 func searchForSolution(ctx context.Context, originalInput, failedCommand, errorMsg string) (string, bool) {
+	// 1. LOCAL FALLBACK: If it's a package error on Linux, try apt-cache search
+	if runtime.GOOS == "linux" && (strings.Contains(errorMsg, "Unable to locate package") || strings.Contains(errorMsg, "not found")) {
+		fmt.Printf("\n%s🔍 Local search: Looking for package in apt-cache...%s\n", colorCyan, colorReset)
+		// Try to extract package name from the original input or error
+		words := strings.Fields(originalInput)
+		for _, word := range words {
+			if word == "install" || word == "get" { continue }
+			out, err := exec.Command("apt-cache", "search", word).Output()
+			if err == nil && len(out) > 0 {
+				lines := strings.Split(string(out), "\n")
+				if len(lines) > 0 {
+					parts := strings.Split(lines[0], " - ")
+					if len(parts) > 0 {
+						pkgName := strings.TrimSpace(parts[0])
+						fmt.Printf("%s💡 Found matching package: %s%s\n", colorGreen, pkgName, colorReset)
+						return "sudo apt install " + pkgName, true
+					}
+				}
+			}
+		}
+	}
+
 	fmt.Printf("\n%s🔍 Command failed. Searching for a solution...%s\n", colorCyan, colorReset)
 
 	// Simple DuckDuckGo search query
