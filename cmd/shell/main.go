@@ -2,23 +2,23 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	// Assumes a `go.mod` file defines the module name (e.g., 'shell')
 	"shell/presets"
 
 	"github.com/charmbracelet/huh"
-	"github.com/google/generative-ai-go/genai"
-	"google.golang.org/api/option"
 )
 
 type AppConfig struct {
@@ -39,7 +39,6 @@ type ProviderConfig struct {
 }
 
 var (
-	aiClient *genai.Client
 	config   = AppConfig{
 		Provider: "google",
 		Model:    "gemini-1.5-flash",
@@ -50,16 +49,6 @@ var (
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 	ctx := context.Background()
-
-	// Initialize the AI client once at startup for better performance and resource management
-	if config.APIKey != "" {
-		var err error
-		aiClient, err = genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating AI client: %v\n", err)
-		}
-	}
-	defer func() { if aiClient != nil { aiClient.Close() } }()
 
 	fmt.Println("Welcome to AI Shell. Type natural language, native commands, '/model' for AI setup, '/settings' for preferences, or 'exit' to quit.")
 
@@ -123,13 +112,7 @@ func main() {
 		}()
 
 		// 1. Send English text to real AI for translation
-		command, isSafe := generateCommandFromAI(ctx, input)
-
-		// Stop the spinner
-		done <- true
-
-		// Visually display the generated command to simulate the "replacement" feel
-		fmt.Printf("\033[32m-> %s\033[0m\n", command)
+		command, isSafe := generateCommandFromAI(ctx, input, done)
 
 		// 2. Safety Verification
 		if !isSafe {
@@ -232,22 +215,7 @@ func handleModelConfig(ctx context.Context) {
 
 	config.Provider, config.Model, config.APIKey = p, m, k
 
-	if config.Provider == "google" {
-		if aiClient != nil {
-			aiClient.Close()
-		}
-		if config.APIKey != "" {
-			client, err := genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
-			if err != nil {
-				fmt.Printf("\n\033[31mError creating AI client:\033[0m %v\n", err)
-			} else {
-				aiClient = client
-				fmt.Println("\n\033[32mSuccessfully updated Google Gemini configuration.\033[0m")
-			}
-		}
-	} else {
-		fmt.Printf("\n\033[33mConfiguration saved. Note: %s integration is currently a placeholder.\033[0m\n", config.Provider)
-	}
+	fmt.Printf("\n\033[32mSuccessfully updated AI configuration to %s (%s).\033[0m\n", config.Provider, config.Model)
 }
 
 // fetchAIRegistry retrieves the native providers and dynamically fetches OpenRouter's list
@@ -314,54 +282,146 @@ func fetchAIRegistry() AIRegistry {
 }
 
 // generateCommandFromAI uses the configured AI API to translate natural language into commands
-func generateCommandFromAI(ctx context.Context, input string) (string, bool) {
-	if config.Provider != "google" {
-		return fmt.Sprintf("echo \033[31mError: Generation for provider '%s' is not implemented yet. Please use '/model' to switch to Google.\033[0m", config.Provider), true
+func generateCommandFromAI(ctx context.Context, input string, done chan bool) (string, bool) {
+	var stopSpinnerOnce sync.Once
+	stopSpinner := func() {
+		stopSpinnerOnce.Do(func() {
+			done <- true
+		})
+	}
+	defer stopSpinner() // Ensure spinner channel is always resolved
+
+	if config.APIKey == "" {
+		return "echo \033[31mError: API key is not configured. Please use '/model' to set it.\033[0m", true
 	}
 
-	if aiClient == nil {
-		return "echo \033[31mError: AI client is not configured. Please use '/model' to set your API key.\033[0m", true
+	var baseURL string
+	modelID := config.Model
+
+	switch config.Provider {
+	case "google":
+		baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+	case "openai":
+		baseURL = "https://api.openai.com/v1/chat/completions"
+	case "openrouter":
+		baseURL = "https://openrouter.ai/api/v1/chat/completions"
+	default:
+		// Use OpenRouter as the unified source to hit the latest API endpoints for any other provider
+		baseURL = "https://openrouter.ai/api/v1/chat/completions"
+		modelID = config.Provider + "/" + config.Model
 	}
 
-	model := aiClient.GenerativeModel(config.Model)
-	model.SetTemperature(0.1) // Lower temperature for more deterministic outputs
-	
 	cwd, _ := os.Getwd()
 	prompt := fmt.Sprintf(`You are a lightweight AI shell assistant for %s. 
 Translate the user's natural language into a valid %s terminal command.
 The current working directory is: %s
 If the input is already a valid command, return it as is.
-Return ONLY a raw JSON object. Do not wrap it in markdown block quotes.
-Format: {"command": "the command to run", "is_safe": true/false}
-Set is_safe to false ONLY for destructive/dangerous commands (e.g., delete, format, rmdir).
+Return ONLY the raw command. Do not wrap it in quotes, markdown, or JSON.
+If the command is destructive or dangerous (e.g., delete, format, rmdir), prefix it EXACTLY with "UNSAFE: ".
+Otherwise, just output the command directly.
 
 User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 
-	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil || len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return "echo \033[31mAI Error: unable to generate a response\033[0m", true
+	reqBody := map[string]interface{}{
+		"model": modelID,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.1,
+		"stream":      true,
 	}
 
-	textResponse, ok := resp.Candidates[0].Content.Parts[0].(genai.Text)
-	if !ok {
-		return "echo \033[31mAI Error: unexpected response format\033[0m", true
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Sprintf("echo \033[31mError encoding JSON:\033[0m %v", err), true
 	}
 
-	// Clean potential markdown codeblock formatting that the AI might forcefully inject
-	cleanJSON := strings.TrimPrefix(strings.TrimSpace(string(textResponse)), "```json")
-	cleanJSON = strings.TrimPrefix(cleanJSON, "```")
-	cleanJSON = strings.TrimSuffix(cleanJSON, "```")
-
-	var aiResp struct {
-		Command string `json:"command"`
-		IsSafe  bool   `json:"is_safe"`
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(jsonData))
+	if err != nil {
+		return fmt.Sprintf("echo \033[31mError creating request:\033[0m %v", err), true
 	}
 
-	if err := json.Unmarshal([]byte(cleanJSON), &aiResp); err != nil {
-		return fmt.Sprintf("echo \033[31mError parsing AI JSON response:\033[0m %v", err), false
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	if baseURL == "https://openrouter.ai/api/v1/chat/completions" {
+		req.Header.Set("HTTP-Referer", "https://github.com/shell")
+		req.Header.Set("X-Title", "AI Shell")
 	}
 
-	return aiResp.Command, aiResp.IsSafe
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Sprintf("echo \033[31mAPI Error:\033[0m %v", err), true
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("echo \033[31mAPI Error (%d):\033[0m %s", resp.StatusCode, string(body)), true
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var fullResponse string
+	firstChunk := true
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
+			}
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal([]byte(data), &chunk); err == nil {
+				if len(chunk.Choices) > 0 {
+					content := chunk.Choices.Delta.Content
+					if content != "" {
+						if firstChunk {
+							stopSpinner()
+							fmt.Print("\033[32m-> ")
+							firstChunk = false
+						}
+						fmt.Print(content)
+						fullResponse += content
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Sprintf("echo \033[31mStream Error:\033[0m %v", err), true
+	}
+
+	if firstChunk {
+		stopSpinner()
+	} else {
+		fmt.Println("\033[0m") // Reset color and finalize newline
+	}
+
+	fullResponse = strings.TrimSpace(fullResponse)
+	isSafe := true
+	if strings.HasPrefix(fullResponse, "UNSAFE: ") {
+		isSafe = false
+		fullResponse = strings.TrimPrefix(fullResponse, "UNSAFE: ")
+	} else if strings.HasPrefix(fullResponse, "UNSAFE:") {
+		isSafe = false
+		fullResponse = strings.TrimPrefix(fullResponse, "UNSAFE:")
+	}
+
+	fullResponse = strings.TrimPrefix(fullResponse, "```bash")
+	fullResponse = strings.TrimPrefix(fullResponse, "```sh")
+	fullResponse = strings.TrimPrefix(fullResponse, "```")
+	fullResponse = strings.TrimSuffix(fullResponse, "```")
+	fullResponse = strings.TrimSpace(fullResponse)
+
+	return fullResponse, isSafe
 }
 
 func executeCommand(cmdStr string) {
