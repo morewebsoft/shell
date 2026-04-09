@@ -44,7 +44,27 @@ var (
 		Model:    "gemini-1.5-flash",
 		APIKey:   os.Getenv("GEMINI_API_KEY"),
 	}
+
+	colorCyan   = "\033[36m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorRed    = "\033[31m"
+	colorPurple = "\033[35m"
+	colorReset  = "\033[0m"
+	clearLine   = "\r\033[K"
 )
+
+func init() {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" || (runtime.GOOS == "windows" && os.Getenv("TERM") == "" && os.Getenv("WT_SESSION") == "") {
+		colorCyan = ""
+		colorGreen = ""
+		colorYellow = ""
+		colorRed = ""
+		colorPurple = ""
+		colorReset = ""
+		clearLine = "\r" + strings.Repeat(" ", 80) + "\r"
+	}
+}
 
 func main() {
 	loadConfig()
@@ -56,7 +76,7 @@ func main() {
 	for {
 		// The native terminal prompt
 		cwd, _ := os.Getwd()
-		fmt.Printf("\033[36mai-shell %s>\033[0m ", cwd)
+		fmt.Printf("%sai-shell %s>%s ", colorCyan, cwd, colorReset)
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -87,7 +107,7 @@ func main() {
 
 		// Check for a preset command first for performance and to bypass AI
 		if command, found := presets.CheckForPreset(input); found {
-			fmt.Printf("\033[32m-> %s\033[0m\n", command) // Show the resolved command
+			fmt.Printf("%s-> %s%s\n", colorGreen, command, colorReset) // Show the resolved command
 			// Presets are considered safe and are executed directly
 			executeCommand(command)
 			continue // Skip AI and go to next prompt
@@ -102,11 +122,11 @@ func main() {
 				select {
 				case <-done:
 					// Clear the spinner line completely
-					fmt.Print("\r\033[K")
+					fmt.Print(clearLine)
 					done <- true
 					return
 				default:
-					fmt.Printf("\r\033[35m%s Translating...\033[0m", chars[i])
+					fmt.Printf("\r%s%s Translating...%s", colorPurple, chars[i], colorReset)
 					i = (i + 1) % len(chars)
 					time.Sleep(100 * time.Millisecond)
 				}
@@ -118,7 +138,7 @@ func main() {
 
 		// 2. Safety Verification
 		if !isSafe {
-			fmt.Print("\033[33m⚠️  Command might be unsafe. Execute? (y/n):\033[0m ")
+			fmt.Printf("%s⚠️  Command might be unsafe. Execute? (y/n):%s ", colorYellow, colorReset)
 			confirm, _ := reader.ReadString('\n')
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
 				fmt.Println("Execution cancelled.")
@@ -140,7 +160,7 @@ func handleSettings() {
 }
 
 func handleModelConfig(ctx context.Context) {
-	fmt.Print("\n\033[36mFetching latest AI providers and models...\033[0m\n")
+	fmt.Printf("\n%sFetching latest AI providers and models...%s\n", colorCyan, colorReset)
 	registry := fetchAIRegistry()
 
 	var providerOptions []huh.Option[string]
@@ -161,7 +181,7 @@ func handleModelConfig(ctx context.Context) {
 	).Run()
 
 	if err != nil {
-		fmt.Println("\n\033[31mConfiguration cancelled:\033[0m", err)
+		fmt.Printf("\n%sConfiguration cancelled:%s %v\n", colorRed, colorReset, err)
 		return
 	}
 
@@ -196,7 +216,7 @@ func handleModelConfig(ctx context.Context) {
 	).Run()
 
 	if err != nil {
-		fmt.Println("\n\033[31mConfiguration cancelled:\033[0m", err)
+		fmt.Printf("\n%sConfiguration cancelled:%s %v\n", colorRed, colorReset, err)
 		return
 	}
 	
@@ -210,7 +230,7 @@ func handleModelConfig(ctx context.Context) {
 			),
 		).Run()
 		if err != nil {
-			fmt.Println("\n\033[31mConfiguration cancelled:\033[0m", err)
+			fmt.Printf("\n%sConfiguration cancelled:%s %v\n", colorRed, colorReset, err)
 			return
 		}
 	}
@@ -218,7 +238,7 @@ func handleModelConfig(ctx context.Context) {
 	config.Provider, config.Model, config.APIKey = p, m, k
 	saveConfig()
 
-	fmt.Printf("\n\033[32mSuccessfully updated AI configuration to %s (%s).\033[0m\n", config.Provider, config.Model)
+	fmt.Printf("\n%sSuccessfully updated AI configuration to %s (%s).%s\n", colorGreen, config.Provider, config.Model, colorReset)
 }
 
 // fetchAIRegistry retrieves the native providers and dynamically fetches OpenRouter's list
@@ -298,7 +318,7 @@ func generateCommandFromAI(ctx context.Context, input string, done chan bool) (s
 
 	if config.APIKey == "" {
 		stopSpinner()
-		fmt.Println("\r\033[31mError: API key is not configured. Please use '/model' to set it.\033[0m")
+		fmt.Printf("\r%sError: API key is not configured. Please use '/model' to set it.%s\n", colorRed, colorReset)
 		return "", true
 	}
 
@@ -343,14 +363,14 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		stopSpinner()
-		fmt.Printf("\r\033[31mError encoding JSON:\033[0m %v\n", err)
+		fmt.Printf("\r%sError encoding JSON:%s %v\n", colorRed, colorReset, err)
 		return "", true
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(jsonData))
 	if err != nil {
 		stopSpinner()
-		fmt.Printf("\r\033[31mError creating request:\033[0m %v\n", err)
+		fmt.Printf("\r%sError creating request:%s %v\n", colorRed, colorReset, err)
 		return "", true
 	}
 
@@ -365,7 +385,7 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 	resp, err := client.Do(req)
 	if err != nil {
 		stopSpinner()
-		fmt.Printf("\r\033[31mAPI Error:\033[0m %v\n", err)
+		fmt.Printf("\r%sAPI Error:%s %v\n", colorRed, colorReset, err)
 		return "", true
 	}
 	defer resp.Body.Close()
@@ -373,7 +393,7 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 	if resp.StatusCode != http.StatusOK {
 		stopSpinner()
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("\r\033[31mAPI Error (%d):\033[0m %s\n", resp.StatusCode, string(body))
+		fmt.Printf("\r%sAPI Error (%d):%s %s\n", colorRed, resp.StatusCode, colorReset, string(body))
 		return "", true
 	}
 
@@ -401,7 +421,7 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 					if content != "" {
 						if firstChunk {
 							stopSpinner()
-							fmt.Print("\033[32m-> ")
+							fmt.Print(colorGreen + "-> ")
 							firstChunk = false
 						}
 						fmt.Print(content)
@@ -414,14 +434,14 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 
 	if err := scanner.Err(); err != nil {
 		stopSpinner()
-		fmt.Printf("\r\033[31mStream Error:\033[0m %v\n", err)
+		fmt.Printf("\r%sStream Error:%s %v\n", colorRed, colorReset, err)
 		return "", true
 	}
 
 	if firstChunk {
 		stopSpinner()
 	} else {
-		fmt.Println("\033[0m") // Reset color and finalize newline
+		fmt.Println(colorReset) // Reset color and finalize newline
 	}
 
 	fullResponse = strings.TrimSpace(fullResponse)
@@ -486,7 +506,7 @@ func executeCommand(cmdStr string) {
 		
 		dir = strings.Trim(dir, "\"'") // Remove quotes if any
 		if err := os.Chdir(dir); err != nil {
-			fmt.Printf("\033[31mcd failed:\033[0m %v\n", err)
+			fmt.Printf("%scd failed:%s %v\n", colorRed, colorReset, err)
 		}
 		return
 	}
@@ -510,7 +530,7 @@ func executeCommand(cmdStr string) {
 
 	err := cmd.Run()
 	if err != nil {
-		fmt.Printf("\033[31mCommand failed:\033[0m %v\n", err)
+		fmt.Printf("%sCommand failed:%s %v\n", colorRed, colorReset, err)
 	}
 }
 func getConfigPath() string {
