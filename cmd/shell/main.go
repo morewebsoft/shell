@@ -139,8 +139,104 @@ func handleSettings() {
 	fmt.Println("(Note: Settings interactive menu to be implemented)\n")
 }
 
+func fetchAIRegistry() AIRegistry {
+	registry := AIRegistry{
+		Providers: []ProviderConfig{
+			{ID: "google", Name: "Google", Models: []string{}},
+			{ID: "openai", Name: "OpenAI", Models: []string{}},
+			{ID: "anthropic", Name: "Anthropic", Models: []string{}},
+			{ID: "groq", Name: "Groq", Models: []string{}},
+			{ID: "openrouter", Name: "OpenRouter", Models: []string{}},
+			{ID: "vertex", Name: "Vertex AI", Models: []string{}},
+		},
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	// Fetching real-time models from OpenRouter as a primary source for discovery
+	resp, err := client.Get("https://openrouter.ai/api/v1/models")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		var orResp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&orResp); err == nil {
+			dynamicModels := make(map[string][]string)
+			var orModels []string
+			for _, m := range orResp.Data {
+				orModels = append(orModels, m.ID)
+				parts := strings.SplitN(m.ID, "/", 2)
+				if len(parts) == 2 {
+					dynamicModels[parts[0]] = append(dynamicModels[parts[0]], parts[1])
+				}
+			}
+			for i, prov := range registry.Providers {
+				if prov.ID == "openrouter" {
+					registry.Providers[i].Models = orModels
+				} else if models, ok := dynamicModels[prov.ID]; ok && len(models) > 0 {
+					registry.Providers[i].Models = models
+				}
+			}
+		}
+	}
+	return registry
+}
+
+func fetchModelsForProvider(provider, apiKey string) []string {
+	var apiURL string
+	switch provider {
+	case "groq":
+		apiURL = "https://api.groq.com/openai/v1/models"
+	case "openai":
+		apiURL = "https://api.openai.com/v1/models"
+	case "google":
+		apiURL = "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey
+	default:
+		return nil
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequest("GET", apiURL, nil)
+	if provider != "google" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var models []string
+	if provider == "google" {
+		var gResp struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&gResp); err == nil {
+			for _, m := range gResp.Models {
+				name := strings.TrimPrefix(m.Name, "models/")
+				models = append(models, name)
+			}
+		}
+	} else {
+		var oResp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&oResp); err == nil {
+			for _, m := range oResp.Data {
+				models = append(models, m.ID)
+			}
+		}
+	}
+	return models
+}
+
 func handleModelConfig(ctx context.Context) {
-	fmt.Print("\n\033[36mFetching latest AI providers and models...\033[0m\n")
 	registry := fetchAIRegistry()
 
 	var providerOptions []huh.Option[string]
@@ -149,14 +245,19 @@ func handleModelConfig(ctx context.Context) {
 	}
 
 	p := config.Provider
-	
-	// Step 1: Provider Selection
+	k := config.APIKey
+
+	// Step 1: Provider and Key Selection
 	err := huh.NewForm(
 		huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("AI Provider").
 				Options(providerOptions...).
 				Value(&p),
+			huh.NewInput().
+				Title("API Key").
+				EchoMode(huh.EchoModePassword).
+				Value(&k),
 		),
 	).Run()
 
@@ -165,33 +266,39 @@ func handleModelConfig(ctx context.Context) {
 		return
 	}
 
-	// Step 2: Dynamic Model Options based on Provider
-	var modelOptions []huh.Option[string]
-	for _, prov := range registry.Providers {
-		if prov.ID == p {
-			for _, mod := range prov.Models {
-				modelOptions = append(modelOptions, huh.NewOption(mod, mod))
+	fmt.Print("\n\033[36mFetching latest models for selected provider...\033[0m\n")
+	
+	// Try fetching directly from provider first, then fallback to registry (OpenRouter)
+	fetchedModels := fetchModelsForProvider(p, k)
+	if len(fetchedModels) == 0 {
+		for _, prov := range registry.Providers {
+			if prov.ID == p {
+				fetchedModels = prov.Models
+				break
 			}
-			break
 		}
+	}
+
+	var modelOptions []huh.Option[string]
+	for _, mod := range fetchedModels {
+		modelOptions = append(modelOptions, huh.NewOption(mod, mod))
 	}
 	modelOptions = append(modelOptions, huh.NewOption("Custom (Type manually)", "custom"))
 
 	m := config.Model
-	k := config.APIKey
+	if len(fetchedModels) > 0 && (m == "" || !contains(fetchedModels, m)) {
+		m = fetchedModels[0]
+	}
 
+	// Step 2: Model Selection
 	err = huh.NewForm(
 		huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("Model").
-				Description("Type to search/filter models...").
+				Description("Select a model or type manually...").
 				Height(10).
 				Options(modelOptions...).
 				Value(&m),
-			huh.NewInput().
-				Title("API Key").
-				EchoMode(huh.EchoModePassword).
-				Value(&k),
 		),
 	).Run()
 
@@ -221,68 +328,13 @@ func handleModelConfig(ctx context.Context) {
 	fmt.Printf("\n\033[32mSuccessfully updated AI configuration to %s (%s).\033[0m\n", config.Provider, config.Model)
 }
 
-// fetchAIRegistry retrieves the native providers and dynamically fetches OpenRouter's list
-func fetchAIRegistry() AIRegistry {
-	registry := AIRegistry{
-		Providers: []ProviderConfig{
-			{ID: "google", Name: "Google", Models: []string{"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"}},
-			{ID: "openai", Name: "OpenAI", Models: []string{"gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "gpt-4o-mini"}},
-			{ID: "anthropic", Name: "Anthropic", Models: []string{"claude-3-5-sonnet-20240620", "claude-3-opus-20240229"}},
-			{ID: "groq", Name: "Groq", Models: []string{"gpt-oss-120b", "gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama-4-scout"}},
-			{ID: "vertex", Name: "Vertex AI", Models: []string{"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"}},
-		},
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	// Fetching real-time models from OpenRouter (no API key required for this endpoint)
-	resp, err := client.Get("https://openrouter.ai/api/v1/models")
-	if err != nil || resp.StatusCode != 200 {
-		return registry
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return registry
-	}
-
-	var orResp struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &orResp); err != nil {
-		return registry
-	}
-
-	var orModels []string
-	dynamicModels := make(map[string][]string)
-
-	for _, m := range orResp.Data {
-		orModels = append(orModels, m.ID)
-
-		// Use OpenRouter to dynamically discover native models
-		parts := strings.SplitN(m.ID, "/", 2)
-		if len(parts) == 2 {
-			dynamicModels[parts[0]] = append(dynamicModels[parts[0]], parts[1])
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
 		}
 	}
-
-	for i, prov := range registry.Providers {
-		if models, ok := dynamicModels[prov.ID]; ok && len(models) > 0 {
-			registry.Providers[i].Models = models
-		}
-	}
-
-	if len(orModels) > 0 {
-		registry.Providers = append(registry.Providers, ProviderConfig{
-			ID:     "openrouter",
-			Name:   "OpenRouter",
-			Models: orModels,
-		})
-	}
-
-	return registry
+	return false
 }
 
 // generateCommandFromAI uses the configured AI API to translate natural language into commands
