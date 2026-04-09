@@ -438,12 +438,12 @@ User input: %s`, runtime.GOOS, runtime.GOOS, cwd, input)
 			block = strings.TrimSpace(block)
 			lines := strings.SplitN(block, "\n", 2)
 			if len(lines) == 2 {
-				firstLine := strings.TrimSpace(strings.ToLower(lines))
+				firstLine := strings.TrimSpace(strings.ToLower(lines[0]))
 				if firstLine == "bash" || firstLine == "sh" || firstLine == "shell" || firstLine == "cmd" || firstLine == "powershell" {
-					block = strings.TrimSpace(lines)
+					block = strings.TrimSpace(lines[1])
 				}
 			} else if len(lines) == 1 {
-				firstLine := strings.TrimSpace(strings.ToLower(lines))
+				firstLine := strings.TrimSpace(strings.ToLower(lines[0]))
 				if firstLine == "bash" || firstLine == "sh" || firstLine == "shell" || firstLine == "cmd" || firstLine == "powershell" {
 					block = ""
 				}
