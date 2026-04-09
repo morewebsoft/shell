@@ -248,7 +248,7 @@ func fetchAIRegistry() AIRegistry {
 			{ID: "google", Name: "Google", Models: []string{"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"}},
 			{ID: "openai", Name: "OpenAI", Models: []string{"gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "gpt-4o-mini"}},
 			{ID: "anthropic", Name: "Anthropic", Models: []string{"claude-3-5-sonnet-20240620", "claude-3-opus-20240229"}},
-			{ID: "groq", Name: "Groq", Models: []string{"llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma-7b-it"}},
+			{ID: "groq", Name: "Groq", Models: []string{"gpt-oss-120b", "gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama-4-scout"}},
 			{ID: "vertex", Name: "Vertex AI", Models: []string{"gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"}},
 		},
 	}
