@@ -31,16 +31,19 @@ type FavoriteModel struct {
 }
 
 type AppConfig struct {
-	Provider    string
-	Model       string
-	APIKey      string
-	ProxyURL    string
-	AutoExecute bool
-	AIMemory    string
+	Provider               string
+	Model                  string
+	APIKey                 string
+	ProxyURL               string
+	AutoExecute            bool
+	AIMemory               string
 	EnableHistory          bool
 	EnableSessionMemory    bool
 	EnablePersistentMemory bool
 	Favorites              []FavoriteModel `json:"favorites"`
+	AutoStartOllama        bool
+	HistoryLimit           int
+	FirstLaunch            bool
 }
 
 // AIRegistry represents a dynamic list of providers and models
@@ -373,6 +376,10 @@ func handleSetup() {
 			if config.AutoExecute {
 				toggleLabel = "Disable Auto-Execution"
 			}
+			ollamaToggleLabel := "Enable Auto-Start Ollama"
+			if config.AutoStartOllama {
+				ollamaToggleLabel = "Disable Auto-Start Ollama"
+			}
 
 			err := huh.NewForm(
 				huh.NewGroup(
@@ -380,6 +387,7 @@ func handleSetup() {
 						Title("Execution Settings").
 						Options(
 							huh.NewOption(toggleLabel, "toggle"),
+							huh.NewOption(ollamaToggleLabel, "toggle_ollama"),
 							huh.NewOption("Back", "back"),
 						).
 						Value(&execAction),
@@ -394,6 +402,15 @@ func handleSetup() {
 					status = "ON"
 				}
 				fmt.Printf("\n%sAuto-execution is now %s.%s\n", colorGreen, status, colorReset)
+				time.Sleep(1 * time.Second)
+			} else if err == nil && execAction == "toggle_ollama" {
+				config.AutoStartOllama = !config.AutoStartOllama
+				saveConfig()
+				status := "OFF"
+				if config.AutoStartOllama {
+					status = "ON"
+				}
+				fmt.Printf("\n%sAuto-Start Ollama is now %s.%s\n", colorGreen, status, colorReset)
 				time.Sleep(1 * time.Second)
 			}
 
@@ -686,7 +703,7 @@ func handleModelSwitch() {
 	var choice string
 	err := huh.NewForm(
 		huh.NewGroup(
-			huh.NewSelectstring.
+			huh.NewSelect[string]().
 				Title("Favorite Models").
 				Options(options...).
 				Value(&choice),
@@ -737,7 +754,7 @@ func handleModelSwitch() {
 		var rmChoice string
 		err := huh.NewForm(
 			huh.NewGroup(
-				huh.NewSelectstring.
+				huh.NewSelect[string]().
 					Title("Select favorite to remove").
 					Options(rmOptions...).
 					Value(&rmChoice),
@@ -1102,13 +1119,96 @@ func getConfigPath() string {
 	return filepath.Join(configDir, "config.json")
 }
 
+// isOllamaRunning checks if Ollama is reachable on its default port.
+func isOllamaRunning() bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:11434/v1/models")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// tryAutoStartOllama attempts to start the Ollama daemon in the background.
+func tryAutoStartOllama() bool {
+	if _, err := exec.LookPath("ollama"); err != nil {
+		return false
+	}
+	cmd := exec.Command("ollama", "serve")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if isOllamaRunning() {
+			return true
+		}
+	}
+	return false
+}
+
+// detectLocalLLM checks for a running local provider and returns (provider, firstModel).
+func detectLocalLLM() (string, string) {
+	if isOllamaRunning() {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get("http://localhost:11434/v1/models")
+		if err == nil && resp.StatusCode == 200 {
+			defer resp.Body.Close()
+			var body struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&body); err == nil && len(body.Data) > 0 {
+				return "ollama", body.Data[0].ID
+			}
+		}
+		return "ollama", ""
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:1234/v1/models")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		var body struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err == nil && len(body.Data) > 0 {
+			return "lmstudio", body.Data[0].ID
+		}
+		return "lmstudio", ""
+	}
+	return "", ""
+}
+
 func loadConfig() {
 	path := getConfigPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// First run — auto-detect a running local LLM
+		if provider, model := detectLocalLLM(); provider != "" {
+			config.Provider = provider
+			config.Model = model
+			config.FirstLaunch = false
+			saveConfig()
+		}
 		return
 	}
 	_ = json.Unmarshal(data, &config)
+
+	// Auto-start Ollama if configured and not already running
+	if config.Provider == "ollama" && config.AutoStartOllama && !isOllamaRunning() {
+		fmt.Printf("%s⚡ Auto-starting Ollama...%s\n", colorCyan, colorReset)
+		if tryAutoStartOllama() {
+			fmt.Printf("%s✓ Ollama started%s\n", colorGreen, colorReset)
+		} else {
+			fmt.Printf("%s⚠ Could not auto-start Ollama. Is it installed?%s\n", colorYellow, colorReset)
+		}
+	}
 }
 
 func saveConfig() {
