@@ -1264,9 +1264,13 @@ func callAI(ctx context.Context, prompt, spinnerLabel string) string {
 		req.Header.Set("X-Title", "IntelliShell")
 	}
 
-	// Spinner
+	// Spinner — use WaitGroup so callers block until the goroutine has fully
+	// exited (and printed clearLine) before writing anything else to the terminal.
 	spinDone := make(chan struct{})
+	var spinWg sync.WaitGroup
+	spinWg.Add(1)
 	go func() {
+		defer spinWg.Done()
 		chars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 		i := 0
 		for {
@@ -1282,7 +1286,12 @@ func callAI(ctx context.Context, prompt, spinnerLabel string) string {
 		}
 	}()
 	stopSpin := sync.Once{}
-	stop := func() { stopSpin.Do(func() { close(spinDone) }) }
+	stop := func() {
+		stopSpin.Do(func() {
+			close(spinDone)
+			spinWg.Wait() // block until goroutine has cleared the line
+		})
+	}
 	defer stop()
 
 	client := getHTTPClient(0)
@@ -1360,15 +1369,13 @@ func agenticRecover(ctx context.Context, originalInput, failedCmd, stderrOutput 
 		targetOS = "Linux (bash/sh)"
 	}
 
+	attempted := 0
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		attempted = attempt
 		fmt.Printf("\n%s🤔 Analyzing failure [%d/%d]...%s\n", colorPurple, attempt, maxRetries, colorReset)
 
-		// Build a focused search query from the command name + error
-		cmdName := strings.Fields(failedCmd)
-		name := ""
-		if len(cmdName) > 0 {
-			name = cmdName[0]
-		}
+		// Build search query: avoid duplicating the command name when the
+		// stderr already starts with it (e.g. "print: command not found")
 		errLine := stderrOutput
 		if idx := strings.Index(errLine, "\n"); idx > 0 {
 			errLine = errLine[:idx]
@@ -1376,7 +1383,24 @@ func agenticRecover(ctx context.Context, originalInput, failedCmd, stderrOutput 
 		if len(errLine) > 120 {
 			errLine = errLine[:120]
 		}
-		searchQuery := fmt.Sprintf("%s: %s fix linux bash", name, errLine)
+		cmdParts := strings.Fields(failedCmd)
+		cmdName := ""
+		if len(cmdParts) > 0 {
+			cmdName = cmdParts[0]
+		}
+		// Strip bash wrapper (e.g. "bash: line 1: foo: ...") down to the real error
+		cleanErr := errLine
+		if strings.HasPrefix(cleanErr, "bash: line") {
+			if idx := strings.Index(cleanErr[11:], ":"); idx >= 0 {
+				cleanErr = strings.TrimSpace(cleanErr[11+idx+1:])
+			}
+		}
+		// Prepend command name if the error doesn't already start with it
+		searchQuery := cleanErr
+		if !strings.HasPrefix(strings.ToLower(cleanErr), strings.ToLower(cmdName)) {
+			searchQuery = cmdName + " " + cleanErr
+		}
+		searchQuery += " fix linux bash"
 
 		fmt.Printf("%s🔍 Searching: %s%s\n", colorCyan, searchQuery, colorReset)
 		snippets := searchDuckDuckGo(searchQuery)
@@ -1388,7 +1412,7 @@ func agenticRecover(ctx context.Context, originalInput, failedCmd, stderrOutput 
 				webContext += fmt.Sprintf("  [%d] %s\n", i+1, s)
 			}
 		} else {
-			fmt.Printf("%s  (no web results, reasoning from context only)%s\n", colorGrey, colorReset)
+			fmt.Printf("%s  (no web results — reasoning from context only)%s\n", colorGrey, colorReset)
 		}
 
 		cwd, _ := os.Getwd()
@@ -1404,17 +1428,16 @@ Think step by step:
 1. What went wrong?
 2. What is the correct fix?
 
-Return ONLY the corrected command as the last line, with no explanation.
-If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, stderrOutput, cwd, webContext)
+Return ONLY the corrected shell command as the very last line. No explanation, no markdown.
+If destructive, prefix that line with "UNSAFE: ".`, targetOS, originalInput, failedCmd, stderrOutput, cwd, webContext)
 
-		fmt.Printf("%s💭 Thinking...%s\n", colorPurple, colorReset)
 		raw := callAI(ctx, prompt, "Thinking...")
 		if raw == "" {
 			fmt.Printf("%s✗ AI returned no response.%s\n", colorRed, colorReset)
 			break
 		}
 
-		// Extract the last non-empty line as the command
+		// Extract the last non-empty, non-comment line as the command
 		lines := strings.Split(raw, "\n")
 		cmdLine := ""
 		for i := len(lines) - 1; i >= 0; i-- {
@@ -1428,14 +1451,23 @@ If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, st
 
 		if fixedCmd == "" || fixedCmd == failedCmd {
 			fmt.Printf("%s✗ No better command found.%s\n", colorRed, colorReset)
-			break
+			// Widen the search on the next attempt using the original user intent
+			searchQuery = originalInput + " linux bash command"
+			snippets = searchDuckDuckGo(searchQuery)
+			if len(snippets) > 0 {
+				webContext = "\n\nWider search results:\n"
+				for i, s := range snippets {
+					webContext += fmt.Sprintf("  [%d] %s\n", i+1, s)
+				}
+			}
+			continue
 		}
 
 		safeLabel := ""
 		if !safe {
-			safeLabel = fmt.Sprintf(" %s[UNSAFE]%s", colorRed, colorGreen)
+			safeLabel = fmt.Sprintf(" %s[UNSAFE]%s", colorGreen, colorReset)
 		}
-		fmt.Printf("%s💡 Fix: %s%s%s\n", colorGreen, fixedCmd, safeLabel, colorReset)
+		fmt.Printf("%s💡 Fix: %s%s\n", colorGreen, fixedCmd+safeLabel, colorReset)
 
 		// Confirm if needed
 		if !config.AutoExecute || !safe {
@@ -1443,6 +1475,7 @@ If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, st
 			line, err := rl.ReadlineWithDefault("")
 			if err != nil || strings.ToLower(strings.TrimSpace(line)) != "y" {
 				fmt.Println("Recovery cancelled.")
+				fmt.Println() // ensure readline gets a clean line
 				return
 			}
 		}
@@ -1450,7 +1483,8 @@ If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, st
 		// Run the fix
 		runErr, newStderr := runCaptureStderr(fixedCmd, false)
 		if runErr == nil {
-			fmt.Printf("%s✓ Fixed!%s\n", colorGreen, colorReset)
+			fmt.Printf("%s✓ Fixed!\n%s", colorGreen, colorReset)
+			fmt.Println() // clean line for readline
 			return
 		}
 
@@ -1460,7 +1494,8 @@ If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, st
 		stderrOutput = newStderr
 	}
 
-	fmt.Printf("%s✗ Could not auto-recover after %d attempts.%s\n", colorRed, maxRetries, colorReset)
+	fmt.Printf("%s✗ Could not auto-recover after %d attempt(s).%s\n", colorRed, attempted, colorReset)
+	fmt.Println() // reset terminal cursor so readline redraws prompt cleanly
 }
 
 func getConfigPath() string {
