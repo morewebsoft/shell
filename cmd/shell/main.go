@@ -198,6 +198,13 @@ func main() {
 			continue
 		}
 
+		// Solidify native command detection to bypass AI for immediate execution
+		if isNativeCommand(input) {
+			// Ensure native commands are still evaluated by the sandbox by passing false to forceUnsandboxed
+			executeCommand(input, false, rl)
+			continue
+		}
+
 		// Show a premium loading spinner while waiting for the AI
 		done := make(chan bool)
 		go func() {
@@ -848,4 +855,81 @@ func saveConfig() {
 	if err == nil {
 		_ = os.WriteFile(path, data, 0644)
 	}
+}
+
+// isNativeCommand uses heuristics to solidify the distinction between natural language prompts 
+// and valid native system commands, bypassing the AI for immediate execution.
+func isNativeCommand(input string) bool {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return false
+	}
+
+	cmd := parts[0]
+
+	// 1. Built-in shell commands
+	builtins := map[string]bool{
+		"cd": true, "echo": true, "exit": true, "clear": true, "cls": true,
+		"dir": true, "type": true, "del": true, "copy": true, "move": true,
+		"ren": true, "md": true, "rd": true, "history": true, "alias": true,
+		"export": true, "set": true, "source": true, "pwd": true, "pushd": true, "popd": true,
+	}
+	if builtins[strings.ToLower(cmd)] {
+		return true
+	}
+
+	// 2. Direct path execution
+	if strings.HasPrefix(cmd, "./") || strings.HasPrefix(cmd, ".\\") || filepath.IsAbs(cmd) || strings.HasPrefix(cmd, "/") {
+		return true
+	}
+
+	// 3. Executables in PATH
+	if _, err := exec.LookPath(cmd); err == nil {
+		if len(parts) == 1 {
+			return true // Exact command match without arguments (e.g., "ls")
+		}
+
+		// Known CLI tools with subcommands or specific use-cases that shouldn't be confused with natural language
+		subcommands := map[string]bool{
+			"git": true, "docker": true, "kubectl": true, "npm": true,
+			"go": true, "cargo": true, "apt": true, "brew": true,
+			"yarn": true, "make": true, "systemctl": true, "pip": true,
+			"python": true, "python3": true, "node": true, "vim": true,
+			"nano": true, "code": true, "grep": true, "awk": true, "sed": true,
+			"cat": true, "tail": true, "head": true, "less": true,
+			"tar": true, "unzip": true, "curl": true, "wget": true,
+			"ssh": true, "scp": true, "rsync": true, "ping": true,
+			"netstat": true, "ifconfig": true, "ip": true, "top": true,
+			"htop": true, "ps": true, "kill": true, "df": true, "du": true,
+			"free": true, "chmod": true, "chown": true, "rm": true,
+			"mkdir": true, "touch": true, "mv": true, "cp": true,
+			"sudo": true, "su": true, "bash": true, "sh": true, "zsh": true,
+			"fish": true, "tmux": true, "screen": true, "nohup": true,
+			"gcc": true, "g++": true, "clang": true, "clang++": true,
+			"java": true, "javac": true, "rustc": true, "ruby": true,
+			"perl": true, "lua": true,
+		}
+		if subcommands[strings.ToLower(cmd)] {
+			return true
+		}
+
+		// Check if subsequent arguments look like explicit flags or paths
+		for _, arg := range parts[1:] {
+			if strings.HasPrefix(arg, "-") && len(arg) > 1 {
+				return true
+			}
+			if strings.HasPrefix(arg, "/") && len(arg) > 1 {
+				return true
+			}
+			if strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, ".\\") {
+				return true
+			}
+		}
+
+		// If it's an executable but looks like natural language (e.g., "find all large files"),
+		// we return false and let the AI translate it properly.
+		return false
+	}
+
+	return false
 }
