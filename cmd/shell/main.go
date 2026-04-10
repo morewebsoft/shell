@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/TadB0x/IntelliShell/presets"
+	"github.com/PuerkitoBio/goquery"
 
 	"github.com/chzyer/readline"
 	"github.com/charmbracelet/huh"
@@ -302,9 +303,17 @@ func main() {
 			}
 		}
 
-		// 3. Execution
-		executeCommand(command, needsExplicitConfirm, rl)
+		// 3. Execution — capture stderr so we can recover on failure
+		execErr, stderrOut := runCaptureStderr(command, needsExplicitConfirm)
 		addToHistory(input, command)
+		if execErr != nil {
+			if isSigSys(execErr) {
+				// Sandbox triggered — reuse the original sandbox escalation path
+				executeCommand(command, needsExplicitConfirm, rl)
+			} else {
+				agenticRecover(ctx, input, command, stderrOut, rl)
+			}
+		}
 	}
 }
 
@@ -1141,6 +1150,319 @@ func executeCommand(cmdStr string, forceUnsandboxed bool, rl *readline.Instance)
 		fmt.Printf("%sCommand failed:%s %v\n", colorRed, colorReset, err)
 	}
 }
+// ── Agentic recovery ─────────────────────────────────────────────────────────
+
+// runCaptureStderr runs a shell command, pipes stdout to the terminal, and
+// returns the exit error together with any stderr output as a string.
+func runCaptureStderr(cmdStr string, forceUnsandboxed bool) (error, string) {
+	if cmdStr == "" {
+		return nil, ""
+	}
+	var cmd *exec.Cmd
+	useSandbox := !forceUnsandboxed && isSandboxSupported()
+	if useSandbox {
+		exe, _ := os.Executable()
+		cmd = exec.Command(exe, "__sandbox_exec", cmdStr)
+	} else if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("powershell"); err == nil {
+			cmd = exec.Command("powershell", "-Command", cmdStr)
+		} else {
+			cmd = exec.Command("cmd", "/c", cmdStr)
+		}
+	} else {
+		shell := "sh"
+		if _, err := exec.LookPath("bash"); err == nil {
+			shell = "bash"
+		}
+		cmd = exec.Command(shell, "-c", cmdStr)
+	}
+
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	cmd.Stdin = os.Stdin
+	err := cmd.Run()
+	return err, strings.TrimSpace(stderrBuf.String())
+}
+
+// searchDuckDuckGo queries DuckDuckGo (no API key) and returns up to 4 result snippets.
+func searchDuckDuckGo(query string) []string {
+	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest("GET", searchURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil
+	}
+	var snippets []string
+	doc.Find(".result__snippet, .result__body").Each(func(_ int, s *goquery.Selection) {
+		text := strings.TrimSpace(s.Text())
+		if text != "" && len(snippets) < 4 {
+			snippets = append(snippets, text)
+		}
+	})
+	return snippets
+}
+
+// callAI sends a single prompt to the configured AI and returns the full response,
+// showing a spinner with the given label while waiting.
+func callAI(ctx context.Context, prompt, spinnerLabel string) string {
+	if config.APIKey == "" && config.Provider != "ollama" && config.Provider != "lmstudio" {
+		return ""
+	}
+
+	var baseURL string
+	modelID := config.Model
+	switch config.Provider {
+	case "google":
+		baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+	case "openai":
+		baseURL = "https://api.openai.com/v1/chat/completions"
+	case "groq":
+		baseURL = "https://api.groq.com/openai/v1/chat/completions"
+	case "openrouter":
+		baseURL = "https://openrouter.ai/api/v1/chat/completions"
+	case "ollama":
+		baseURL = "http://localhost:11434/v1/chat/completions"
+	case "lmstudio":
+		baseURL = "http://localhost:1234/v1/chat/completions"
+	default:
+		baseURL = "https://openrouter.ai/api/v1/chat/completions"
+		modelID = config.Provider + "/" + config.Model
+	}
+
+	reqBody := map[string]interface{}{
+		"model":       modelID,
+		"messages":    []map[string]string{{"role": "user", "content": prompt}},
+		"temperature": 0.1,
+		"stream":      true,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return ""
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(jsonData))
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	}
+	if baseURL == "https://openrouter.ai/api/v1/chat/completions" {
+		req.Header.Set("HTTP-Referer", "https://github.com/tadB0x/IntelliShell")
+		req.Header.Set("X-Title", "IntelliShell")
+	}
+
+	// Spinner
+	spinDone := make(chan struct{})
+	go func() {
+		chars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		i := 0
+		for {
+			select {
+			case <-spinDone:
+				fmt.Print(clearLine)
+				return
+			default:
+				fmt.Printf("\r%s%s %s%s", colorPurple, chars[i], spinnerLabel, colorReset)
+				i = (i + 1) % len(chars)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+	stopSpin := sync.Once{}
+	stop := func() { stopSpin.Do(func() { close(spinDone) }) }
+	defer stop()
+
+	client := getHTTPClient(0)
+	resp, err := client.Do(req)
+	if err != nil {
+		stop()
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		stop()
+		return ""
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var result string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct{ Content string `json:"content"` } `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err == nil && len(chunk.Choices) > 0 {
+			result += chunk.Choices[0].Delta.Content
+		}
+	}
+	stop()
+	return strings.TrimSpace(result)
+}
+
+// cleanCommand strips markdown fences and UNSAFE prefix from an AI response.
+func cleanCommand(s string) (cmd string, isSafe bool) {
+	isSafe = true
+	if strings.Contains(s, "UNSAFE:") {
+		isSafe = false
+	}
+	if strings.Contains(s, "```") {
+		first := strings.Index(s, "```")
+		last := strings.LastIndex(s, "```")
+		if first != last {
+			block := strings.TrimSpace(s[first+3 : last])
+			lines := strings.SplitN(block, "\n", 2)
+			if len(lines) == 2 {
+				fl := strings.ToLower(strings.TrimSpace(lines[0]))
+				if fl == "bash" || fl == "sh" || fl == "shell" {
+					block = strings.TrimSpace(lines[1])
+				}
+			}
+			s = block
+		}
+	}
+	s = strings.TrimPrefix(s, "UNSAFE: ")
+	s = strings.TrimPrefix(s, "UNSAFE:")
+	s = strings.TrimPrefix(s, "```bash\n")
+	s = strings.TrimPrefix(s, "```sh\n")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s), isSafe
+}
+
+// agenticRecover is called when an AI-generated command fails. It searches the
+// web, thinks through the problem, generates a fix, and retries up to 3 times.
+func agenticRecover(ctx context.Context, originalInput, failedCmd, stderrOutput string, rl *readline.Instance) {
+	const maxRetries = 3
+	targetOS := runtime.GOOS
+	if targetOS == "linux" {
+		targetOS = "Linux (bash/sh)"
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fmt.Printf("\n%s🤔 Analyzing failure [%d/%d]...%s\n", colorPurple, attempt, maxRetries, colorReset)
+
+		// Build a focused search query from the command name + error
+		cmdName := strings.Fields(failedCmd)
+		name := ""
+		if len(cmdName) > 0 {
+			name = cmdName[0]
+		}
+		errLine := stderrOutput
+		if idx := strings.Index(errLine, "\n"); idx > 0 {
+			errLine = errLine[:idx]
+		}
+		if len(errLine) > 120 {
+			errLine = errLine[:120]
+		}
+		searchQuery := fmt.Sprintf("%s: %s fix linux bash", name, errLine)
+
+		fmt.Printf("%s🔍 Searching: %s%s\n", colorCyan, searchQuery, colorReset)
+		snippets := searchDuckDuckGo(searchQuery)
+
+		webContext := ""
+		if len(snippets) > 0 {
+			webContext = "\n\nRelevant web results:\n"
+			for i, s := range snippets {
+				webContext += fmt.Sprintf("  [%d] %s\n", i+1, s)
+			}
+		} else {
+			fmt.Printf("%s  (no web results, reasoning from context only)%s\n", colorGrey, colorReset)
+		}
+
+		cwd, _ := os.Getwd()
+		prompt := fmt.Sprintf(`You are an expert shell debugger for %s.
+
+The user wanted to: %s
+Failed command:     %s
+Error output:       %s
+Working directory:  %s
+%s
+
+Think step by step:
+1. What went wrong?
+2. What is the correct fix?
+
+Return ONLY the corrected command as the last line, with no explanation.
+If destructive, prefix with "UNSAFE: ".`, targetOS, originalInput, failedCmd, stderrOutput, cwd, webContext)
+
+		fmt.Printf("%s💭 Thinking...%s\n", colorPurple, colorReset)
+		raw := callAI(ctx, prompt, "Thinking...")
+		if raw == "" {
+			fmt.Printf("%s✗ AI returned no response.%s\n", colorRed, colorReset)
+			break
+		}
+
+		// Extract the last non-empty line as the command
+		lines := strings.Split(raw, "\n")
+		cmdLine := ""
+		for i := len(lines) - 1; i >= 0; i-- {
+			l := strings.TrimSpace(lines[i])
+			if l != "" && !strings.HasPrefix(l, "#") {
+				cmdLine = l
+				break
+			}
+		}
+		fixedCmd, safe := cleanCommand(cmdLine)
+
+		if fixedCmd == "" || fixedCmd == failedCmd {
+			fmt.Printf("%s✗ No better command found.%s\n", colorRed, colorReset)
+			break
+		}
+
+		safeLabel := ""
+		if !safe {
+			safeLabel = fmt.Sprintf(" %s[UNSAFE]%s", colorRed, colorGreen)
+		}
+		fmt.Printf("%s💡 Fix: %s%s%s\n", colorGreen, fixedCmd, safeLabel, colorReset)
+
+		// Confirm if needed
+		if !config.AutoExecute || !safe {
+			fmt.Printf("%sApply fix? (y/n): %s", colorYellow, colorReset)
+			line, err := rl.ReadlineWithDefault("")
+			if err != nil || strings.ToLower(strings.TrimSpace(line)) != "y" {
+				fmt.Println("Recovery cancelled.")
+				return
+			}
+		}
+
+		// Run the fix
+		runErr, newStderr := runCaptureStderr(fixedCmd, false)
+		if runErr == nil {
+			fmt.Printf("%s✓ Fixed!%s\n", colorGreen, colorReset)
+			return
+		}
+
+		// Still failing — loop with updated context
+		fmt.Printf("%s✗ Fix also failed. Retrying...%s\n", colorRed, colorReset)
+		failedCmd = fixedCmd
+		stderrOutput = newStderr
+	}
+
+	fmt.Printf("%s✗ Could not auto-recover after %d attempts.%s\n", colorRed, maxRetries, colorReset)
+}
+
 func getConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
