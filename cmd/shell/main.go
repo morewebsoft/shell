@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,7 @@ type AppConfig struct {
 	Provider    string
 	Model       string
 	APIKey      string
+	ProxyURL    string
 	AutoExecute bool
 	AIMemory    string
 	EnableHistory          bool
@@ -306,6 +308,7 @@ func handleSetup() {
 						huh.NewOption("AI Configuration ("+apiStatus+")", "ai"),
 						huh.NewOption("Execution ("+autoExecStatus+")", "exec"),
 						huh.NewOption("Context & Memory", "context"),
+						huh.NewOption("Network / Proxy", "network"),
 						huh.NewOption("Back to Shell", "exit"),
 					).
 					Value(&category),
@@ -406,7 +409,53 @@ func handleSetup() {
 				fmt.Printf("\n%sContext settings updated.%s\n", colorGreen, colorReset)
 				time.Sleep(1 * time.Second)
 			}
+
+		case "network":
+			proxyURL := config.ProxyURL
+			err := huh.NewForm(
+				huh.NewGroup(
+					huh.NewInput().
+						Title("Proxy URL (HTTP/SOCKS5)").
+						Description("Leave blank to disable proxy (e.g., socks5://127.0.0.1:1080)").
+						Value(&proxyURL).
+						Validate(func(s string) error {
+							if s == "" {
+								return nil
+							}
+							u, err := url.Parse(s)
+							if err != nil {
+								return err
+							}
+							if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" {
+								return fmt.Errorf("must start with http://, https://, or socks5://")
+							}
+							return nil
+						}),
+				),
+			).Run()
+
+			if err == nil {
+				config.ProxyURL = proxyURL
+				saveConfig()
+				fmt.Printf("\n%sNetwork settings updated.%s\n", colorGreen, colorReset)
+				time.Sleep(1 * time.Second)
+			}
 		}
+	}
+}
+
+func getHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+	if config.ProxyURL != "" {
+		if proxyURL, err := url.Parse(config.ProxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
 	}
 }
 
@@ -424,7 +473,7 @@ func fetchAIRegistry() AIRegistry {
 		},
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := getHTTPClient(5 * time.Second)
 	// Fetching real-time models from OpenRouter as a primary source for discovery
 	resp, err := client.Get("https://openrouter.ai/api/v1/models")
 	if err == nil && resp.StatusCode == 200 {
@@ -473,7 +522,7 @@ func fetchModelsForProvider(provider, apiKey string) []string {
 		return nil
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := getHTTPClient(5 * time.Second)
 	req, _ := http.NewRequest("GET", apiURL, nil)
 	if provider != "google" && apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -736,7 +785,7 @@ User input: %s`, targetOS, targetOS, cwd, historyContext, persistentMemoryContex
 		req.Header.Set("X-Title", "IntelliShell")
 	}
 
-	client := &http.Client{}
+	client := getHTTPClient(0)
 	resp, err := client.Do(req)
 	if err != nil {
 		stopSpinner()
