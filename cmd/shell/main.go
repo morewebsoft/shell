@@ -124,7 +124,7 @@ func main() {
 	)
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          fmt.Sprintf("%s[AI] %s>%s ", colorCyan, "[PWD]", colorReset),
+		Prompt:          fmt.Sprintf("%sAI %s>%s ", colorCyan, "[PWD]", colorReset),
 		AutoComplete:    completer,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
@@ -140,7 +140,7 @@ func main() {
 
 	for {
 		cwd, _ := os.Getwd()
-		rl.SetPrompt(fmt.Sprintf("%s[AI] %s>%s ", colorCyan, cwd, colorReset))
+		rl.SetPrompt(fmt.Sprintf("%sAI %s>%s ", colorCyan, cwd, colorReset))
 
 		line, err := rl.Readline()
 		if err != nil { // Handle Ctrl+C or Ctrl+D
